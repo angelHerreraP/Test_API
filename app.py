@@ -1,133 +1,147 @@
-from flask import Flask, jsonify, request
-from flask_sqlalchemy import SQLAlchemy
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from werkzeug.security import generate_password_hash, check_password_hash
-import os
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from typing import List
 
-app = Flask(__name__)
-
-# Configuración de la base de datos
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://flaskuser:password@localhost/flask_todo'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'password'  # Cambia esta clave secreta
-
-db = SQLAlchemy(app)
-jwt = JWTManager(app)
+# Configuraciones de la base de datos
+SQLALCHEMY_DATABASE_URL = "postgresql://flaskuser:password@localhost/flask_todo"
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 # Modelo de usuario
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
-    password = db.Column(db.String(100), nullable=False)
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password = Column(String(100), nullable=False)
 
 # Modelo de publicación
-class Post(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100), nullable=False)
-    content = db.Column(db.Text, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+class Post(Base):
+    __tablename__ = "posts"
 
-# Crear tablas
-with app.app_context():
-    db.create_all()
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(100), nullable=False)
+    content = Column(Text, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
-@app.route('/')
-def home():
-    return jsonify({"message": "API está funcionando"}), 200
+# Crear las tablas
+Base.metadata.create_all(bind=engine)
 
-# Ruta de registro de usuario
-@app.route('/register', methods=['POST'])
-def register():
-    username = request.json.get('username')
-    password = request.json.get('password')
+# Inicializar FastAPI
+app = FastAPI()
 
-    if not username or not password:
-        return jsonify({"message": "Usuario o contraseña no proporcionados"}), 400
+# Configurar el hash de contraseñas
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-    hashed_password = generate_password_hash(password)
-    new_user = User(username=username, password=hashed_password)
+# Seguridad
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# Modelos Pydantic
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+
+class PostCreate(BaseModel):
+    title: str
+    content: str
+
+class PostResponse(BaseModel):
+    id: int
+    title: str
+    content: str
+    user_id: int
+
+# Funciones para el manejo de la base de datos
+def get_db():
+    db = SessionLocal()
     try:
-        db.session.add(new_user)
-        db.session.commit()
-        return jsonify({"message": "Usuario creado exitosamente"}), 201
-    except:
-        return jsonify({"message": "El usuario ya existe"}), 400
+        yield db
+    finally:
+        db.close()
 
-# Ruta de inicio de sesión
-@app.route('/login', methods=['POST'])
-def login():
-    username = request.json.get('username')
-    password = request.json.get('password')
+# Función para verificar la contraseña
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-    user = User.query.filter_by(username=username).first()
+# Función para hashear la contraseña
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-    if not user or not check_password_hash(user.password, password):
-        return jsonify({"message": "Credenciales incorrectas"}), 401
+# Ruta para registrar un nuevo usuario
+@app.post("/register", response_model=UserResponse)
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    hashed_password = get_password_hash(user.password)
+    db_user = User(username=user.username, password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
-    access_token = create_access_token(identity=user.id)
-    return jsonify(access_token=access_token), 200
+# Ruta para iniciar sesión
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password):
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    return {"access_token": user.username, "token_type": "bearer"}
 
-# Crear una nueva publicación
-@app.route('/posts', methods=['POST'])
-@jwt_required()
-def create_post():
-    title = request.json.get('title')
-    content = request.json.get('content')
-    user_id = get_jwt_identity()
+# Ruta para crear una nueva publicación
+@app.post("/posts", response_model=PostResponse)
+async def create_post(post: PostCreate, db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    user = db.query(User).filter(User.username == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid user")
 
-    if not title or not content:
-        return jsonify({"message": "Título y contenido son necesarios"}), 400
+    new_post = Post(title=post.title, content=post.content, user_id=user.id)
+    db.add(new_post)
+    db.commit()
+    db.refresh(new_post)
+    return new_post
 
-    new_post = Post(title=title, content=content, user_id=user_id)
-    db.session.add(new_post)
-    db.session.commit()
+# Ruta para obtener todas las publicaciones
+@app.get("/posts", response_model=List[PostResponse])
+async def get_posts(db: Session = Depends(get_db)):
+    posts = db.query(Post).all()
+    return posts
 
-    return jsonify({"message": "Publicación creada exitosamente"}), 201
+# Ruta para actualizar una publicación
+@app.put("/posts/{post_id}", response_model=PostResponse)
+async def update_post(post_id: int, post: PostCreate, db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    user = db.query(User).filter(User.username == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid user")
 
-# Obtener todas las publicaciones
-@app.route('/posts', methods=['GET'])
-def get_posts():
-    posts = Post.query.all()
+    db_post = db.query(Post).filter(Post.id == post_id, Post.user_id == user.id).first()
+    if not db_post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-    return jsonify([{
-        "id": post.id,
-        "title": post.title,
-        "content": post.content,
-        "user_id": post.user_id
-    } for post in posts]), 200
+    db_post.title = post.title
+    db_post.content = post.content
+    db.commit()
+    db.refresh(db_post)
+    return db_post
 
-# Actualizar una publicación
-@app.route('/posts/<int:id>', methods=['PUT'])
-@jwt_required()
-def update_post(id):
-    post = Post.query.get_or_404(id)
-    user_id = get_jwt_identity()
+# Ruta para eliminar una publicación
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: int, db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    user = db.query(User).filter(User.username == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid user")
 
-    if post.user_id != user_id:
-        return jsonify({"message": "No autorizado"}), 403
+    db_post = db.query(Post).filter(Post.id == post_id, Post.user_id == user.id).first()
+    if not db_post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-    post.title = request.json.get('title', post.title)
-    post.content = request.json.get('content', post.content)
-
-    db.session.commit()
-
-    return jsonify({"message": "Publicación actualizada"}), 200
-
-# Eliminar una publicación
-@app.route('/posts/<int:id>', methods=['DELETE'])
-@jwt_required()
-def delete_post(id):
-    post = Post.query.get_or_404(id)
-    user_id = get_jwt_identity()
-
-    if post.user_id != user_id:
-        return jsonify({"message": "No autorizado"}), 403
-
-    db.session.delete(post)
-    db.session.commit()
-
-    return jsonify({"message": "Publicación eliminada"}), 200
-
-if __name__ == '__main__':
-    app.run()
+    db.delete(db_post)
+    db.commit()
+    return {"detail": "Post deleted"}
